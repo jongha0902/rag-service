@@ -1,7 +1,7 @@
 # utils/ollama_rag.py
-
 import os
 import requests
+from utils.config import Config
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.prompts import PromptTemplate
@@ -9,10 +9,10 @@ from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # 경로 설정
-vectorstore_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/vectorstore"
-embedding_model_path = "/home/kecpuser/huggingface/hub/models--intfloat--multilingual-e5-large/snapshots/0dc5580a448e4284468b8909bae50fa925907bc5"
-pdf_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/전력시장운영규칙.pdf"
-txt_path = "/home/kecpuser/workspace/ollama_fastapi/app/data/cleaned_text.txt"
+VECTORSTORE_PATH = Config.VECTORSTORE_PATH
+EMBEDDING_MODEL_PATH = Config.EMBEDDING_MODEL_PATH
+PDF_PATH = Config.PDF_PATH
+TXT_PATH = Config.TXT_PATH
 
 vectorstore = None  # ✅ 전역 vectorstore 선언
 
@@ -21,7 +21,7 @@ vectorstore = None  # ✅ 전역 vectorstore 선언
 # -----------------------------------------------------------------
 try:
     print("🧠 임베딩 모델 로드 중... (multilingual-e5-large)")
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_PATH)
     print("✅ 임베딩 모델 로드 완료.")
 except Exception as e:
     print(f"🚫 FATAL: 임베딩 모델 로드 실패: {e}")
@@ -56,11 +56,11 @@ def create_vectorstore():
         print("🚫 ERROR: 임베딩 모델이 로드되지 않아 Vectorstore를 생성할 수 없습니다.")
         return None
 
-    if not os.path.exists(txt_path):
+    if not os.path.exists(TXT_PATH):
         print("📄 PDF에서 텍스트 추출 중...")
-        extracted = extract_text_from_pdf(pdf_path)
-        save_text(extracted, txt_path)
-    with open(txt_path, "r", encoding="utf-8") as f:
+        extracted = extract_text_from_pdf(PDF_PATH)
+        save_text(extracted, TXT_PATH)
+    with open(TXT_PATH, "r", encoding="utf-8") as f:
         raw_text = f.read()
 
     splitter = RecursiveCharacterTextSplitter(
@@ -73,15 +73,15 @@ def create_vectorstore():
     print(f"✅ 필터 후 문서: {len(filtered_docs)}개")
     
     # 👈 전역 임베딩을 사용하므로 이 라인 삭제
-    # embeddings = HuggingFaceEmbeddings(model_name=embedding_model_path)
+    # embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_PATH)
 
-    if not os.path.exists(vectorstore_path):
+    if not os.path.exists(VECTORSTORE_PATH):
         print("💾 FAISS 벡터스토어 생성 중...")
         vectorstore = FAISS.from_documents(filtered_docs, embeddings)
-        vectorstore.save_local(vectorstore_path)
+        vectorstore.save_local(VECTORSTORE_PATH)
     else:
         print("📦 FAISS 벡터스토어 로드 중...")
-        vectorstore = FAISS.load_local(vectorstore_path, embeddings, allow_dangerous_deserialization=True)
+        vectorstore = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
 
     return vectorstore
 

@@ -5,6 +5,10 @@ class Settings(BaseSettings):
     # 1. 필수 항목 (Default 값을 지움 -> .env에 없으면 에러 발생)
     # 보안이 필요한 값들은 절대 코드에 적지 않습니다.
     DB_PATH: str
+    EMBEDDING_MODEL_PATH: str
+    VECTORSTORE_PATH: str
+    PDF_PATH: str
+    TXT_PATH: str
 
     class Config:
         env_file = ".env"
