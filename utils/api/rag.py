@@ -7,11 +7,10 @@ import logging
 import io
 import zipfile
 
-# ----------------------------------------------------
+# ---------------------------------------------------- 
 # 👇 RAG 관련 함수
 # ----------------------------------------------------
-from utils.ollama_rag import rag_with_ollama, rag_with_context, ask_llm_only
-
+from utils.ollama_rag import ( classify_intent, execute_rag_task )
 # ----------------------------------------------------
 # 👇 다양한 파일 파싱을 위한 라이브러리 임포트
 # ----------------------------------------------------
@@ -145,48 +144,46 @@ async def read_file_content(f: UploadFile) -> str:
 @router.post("/ask")
 async def ask_question(
     query: str = Form(...),
-    type: str = Form(...),
+    session_id: str = Form(...),
     file: Optional[List[UploadFile]] = File(None)
 ):
-    question = query.strip()
-    query_type = type.strip()
-
     try:
-        # 🧠 타입 1: 전력거래 RAG
-        if query_type == "1":
-            if not question:
-                raise HTTPException(status_code=400, detail="타입 1은 질문이 필수입니다.")
-            if file:
-                logger.warning("타입 1은 파일을 지원하지 않습니다. 파일이 무시됩니다.")
-            response = rag_with_ollama(question, query_type="1")
+        combined_context = ""
+        has_file = False
+        file_snippet = None
 
-        # 📂 타입 2: 파일 RAG or LLM Only
-        elif query_type == "2":
-            if file and len(file) > 0:
-                logger.info(f"📬 타입 2 (파일 RAG): {len(file)}개 파일 수신됨")
-                file_contents = []
-                for f in file:
-                    try:
-                        extracted = await read_file_content(f)
-                        file_contents.append(extracted)
-                        logger.info(f" - 파일 처리 완료: {f.filename} ({len(extracted)}자)")
-                    except HTTPException as he:
-                        raise he
-                combined_context = "\n\n".join(file_contents)
-                response = rag_with_context(question, combined_context)
-            else:
-                if not question:
-                    raise HTTPException(status_code=400, detail="파일이 없을 때는 질문이 필수입니다.")
-                logger.info("📬 타입 2 (LLM Only): 파일 없음 → LLM 직접 호출")
-                response = ask_llm_only(question)
+        # 1. 파일 처리
+        if file and len(file) > 0:
+            has_file = True
+            logger.info(f"📂 [파일 수신] {len(file)}개 처리 중...")
+            full_text = []
+            for f in file:
+                txt = await read_file_content(f)
+                full_text.append(txt)
+            combined_context = "\n\n".join(full_text)
+            if combined_context:
+                file_snippet = combined_context.strip()[:500]
 
-        else:
-            raise HTTPException(status_code=400, detail=f"유효하지 않은 프롬프트 타입({query_type})입니다.")
+        # 2. 코드 붙여넣기 감지 (파일 없을 때)
+        elif len(query) > 300 or any(k in query[:200] for k in ["import ", "def ", "class ", "function "]):
+            file_snippet = query[:500]
+            combined_context = query
 
-        return JSONResponse(status_code=200, content={"answer": response})
+        # 3. 의도 분류
+        intent = classify_intent(query, has_file=has_file, file_snippet=file_snippet)
+        logger.info(f"🤖 [Router] 분류: {intent} (Session: {session_id})")
 
-    except HTTPException as he:
-        raise he
+        # 4. RAG 실행 엔진 호출
+        answer = execute_rag_task(
+            intent=intent,
+            query=query,
+            session_id=session_id,
+            file_context=combined_context,
+            has_file=has_file
+        )
+
+        return JSONResponse(status_code=200, content={"intent": intent, "answer": answer})
+
     except Exception as e:
-        logger.exception(f"서버 내부 오류: {e}")
-        raise HTTPException(status_code=500, detail=f"서버 내부 오류: {e}")
+        logger.exception("API Error")
+        raise HTTPException(status_code=500, detail=str(e))
