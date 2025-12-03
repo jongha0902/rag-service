@@ -10,7 +10,9 @@ import zipfile
 # ---------------------------------------------------- 
 # 👇 RAG 관련 함수
 # ----------------------------------------------------
-from utils.ollama_rag import ( classify_intent, execute_rag_task )
+# classify_intent 필요 없음. execute_rag_task만 임포트
+from utils.ollama_rag import execute_rag_task
+
 # ----------------------------------------------------
 # 👇 다양한 파일 파싱을 위한 라이브러리 임포트
 # ----------------------------------------------------
@@ -139,7 +141,7 @@ async def read_file_content(f: UploadFile) -> str:
 
 
 # ----------------------------------------------------
-# 👇 메인 RAG 엔드포인트 (수정 없음)
+# 👇 메인 RAG 엔드포인트
 # ----------------------------------------------------
 @router.post("/ask")
 async def ask_question(
@@ -150,8 +152,7 @@ async def ask_question(
     try:
         combined_context = ""
         has_file = False
-        file_snippet = None
-
+        
         # 1. 파일 처리
         if file and len(file) > 0:
             has_file = True
@@ -161,26 +162,30 @@ async def ask_question(
                 txt = await read_file_content(f)
                 full_text.append(txt)
             combined_context = "\n\n".join(full_text)
-            if combined_context:
-                file_snippet = combined_context.strip()[:500]
+            
+            # (기존 file_snippet 생성 로직 제거됨: Router Node에서 직접 처리함)
 
         # 2. 코드 붙여넣기 감지 (파일 없을 때)
         elif len(query) > 300 or any(k in query[:200] for k in ["import ", "def ", "class ", "function "]):
-            file_snippet = query[:500]
+            # 텍스트로 된 코드가 들어온 경우 파일 컨텍스트로 취급
             combined_context = query
+            # has_file은 False로 두어 Router가 CODE_ANALYSIS로 판단하게 유도하거나 
+            # 필요하다면 True로 설정 가능. 여기서는 False 유지 (Router가 텍스트만 보고 판단)
 
-        # 3. 의도 분류
-        intent = classify_intent(query, has_file=has_file, file_snippet=file_snippet)
-        logger.info(f"🤖 [Router] 분류: {intent} (Session: {session_id})")
-
-        # 4. RAG 실행 엔진 호출
-        answer = execute_rag_task(
-            intent=intent,
+        # 3. RAG 실행 엔진 호출 (LangGraph 실행)
+        # execute_rag_task가 내부에서 Intent 분류와 처리를 모두 수행하고 결과를 반환함
+        result = execute_rag_task(
             query=query,
             session_id=session_id,
             file_context=combined_context,
             has_file=has_file
         )
+
+        # 4. 결과 응답
+        intent = result.get("intent", "UNKNOWN")
+        answer = result.get("answer", "")
+        
+        logger.info(f"🤖 [Router Result] Intent: {intent} (Session: {session_id})")
 
         return JSONResponse(status_code=200, content={"intent": intent, "answer": answer})
 
