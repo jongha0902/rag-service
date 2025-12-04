@@ -3,7 +3,7 @@ import logging
 import torch
 import asyncio
 from datetime import datetime, timedelta
-from typing import TypedDict, Dict, Any, Literal
+from typing import TypedDict, Dict, Any, Literal, List, Optional
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -31,7 +31,6 @@ except ImportError:
 
 # 로거 설정
 logger = logging.getLogger(__name__)
-# 필요 시 로그 레벨 강제 조정 (메인에서 설정되어 있다면 생략 가능)
 logger.setLevel(logging.INFO)
 
 
@@ -40,48 +39,32 @@ logger.setLevel(logging.INFO)
 # ==========================================================================
 SQL_SYSTEM_PROMPT = """
     You are an expert Oracle SQL architect.
+    Generate SQL following this strict 7-step reasoning process:
 
-    You MUST generate SQL through the following strict 7-step reasoning process.
+    1. Analyze Rule: Extract calculations/conditions from rules.
+    2. Identify Data Elements: List required fields (e.g., SMP, Generators).
+    3. Map to Schema: Find tables/columns in the provided schema.
+    4. Plan JOINs: Describe JOIN logic.
+    5. Draft SQL: Write SELECT, JOIN, WHERE, GROUP BY.
+    6. Verify: Check if columns exist in schema.
+    7. Final SQL: Output ONLY the SQL code block.
 
-    ### STEP 1: 규정 분석
-    - 사용자의 질문에서 어떤 계산식, 조건, 정의가 필요한지 규정 문서로부터 추출한다.
-
-    ### STEP 2: 필요 데이터 요소 도출
-    - 규정에서 필요한 데이터 요소를 나열한다. 
-    (예: 거래량, SMP, 단가, 정산금액, 발전기 ID 등)
-
-    ### STEP 3: DB 스키마 매핑
-    - 제공된 DB 스키마에서 각 데이터 요소가 어느 테이블/컬럼에 있는지 명확히 매핑한다.
-    - 없는 경우 "존재하지 않음"이라고 표시 (지어내기 금지)
-
-    ### STEP 4: JOIN 계획 생성
-    - 어떤 테이블을 어떤 조건으로 JOIN해야 하는지 단계별로 설명한다.
-
-    ### STEP 5: SQL 초안 조립
-    - Oracle SQL 문법으로 SELECT, JOIN, WHERE, GROUP BY를 작성한다.
-
-    ### STEP 6: 정합성 검증
-    - 테이블/컬럼이 스키마에 실제로 존재하는지 확인한다.
-    - 문제 있으면 수정한다.
-
-    ### STEP 7: 최종 SQL 출력
-    - 최종 SQL만 코드 블록으로 출력한다.
-
-    You MUST follow all 7 steps exactly.
+    If schema info is missing, state "MISSING SCHEMA".
 """
 
 VALIDATOR_SYSTEM_PROMPT = """
-    당신은 AI 답변 평가자입니다.
-    사용자의 [질문]과 AI가 생성한 [답변]을 보고, 답변이 질문 의도에 부합하고 정확한지 평가하세요.
+    당신은 엄격한 AI 답변 감사관(Auditor)입니다.
+    제공된 [검색된 근거 문서]를 바탕으로 AI의 [답변]이 정확한지 검증하십시오.
 
-    다음 기준을 따르세요:
-    1. 답변이 질문에 직접적으로 대답하고 있는가?
-    2. '모르겠습니다' 혹은 무의미한 내용이 아닌가?
-    3. (SQL 생성 요청인 경우) SQL 코드가 포함되어 있는가?
+    ### 검증 기준 (Checklist):
+    1. **근거 일치 여부 (Groundedness):** 답변의 모든 내용은 오직 [검색된 근거 문서]에 포함된 정보여야 합니다. 문서에 없는 내용을 지어냈다면 FAIL입니다.
+    2. **질문 해결 여부 (Relevance):** 사용자의 질문에 대해 동문서답하지 않고 명확한 결론을 제시했습니까?
+    3. **형식 준수 (Format):** (SQL 생성 요청인 경우) 유효한 SQL 구문이 코드 블록으로 포함되어 있습니까?
+    4. **회피성 답변 방지:** "문서에 없습니다"라고 답해야 할 상황이 아닌데도 불필요하게 "모르겠습니다"라고 하지 않았습니까?
 
-    평가 결과는 반드시 다음 형식으로만 출력하세요:
-    STATUS: [PASS 또는 FAIL]
-    REASON: [평가 이유 및 개선 피드백 한 문장]
+    ### 평가 결과 출력 형식:
+    STATUS: [PASS] 또는 [FAIL]
+    REASON: [FAIL인 경우, 구체적으로 문서의 어느 부분과 불일치하는지 또는 무엇이 부족한지 설명]
 """
 
 
@@ -92,7 +75,7 @@ embeddings = None
 db_schema_vectorstore = None
 doc_vectorstore = None
 
-# 세션 저장소
+# 세션 저장소 (In-Memory -> Redis 등으로 교체 권장)
 store = {}
 SESSION_TIMEOUT_MINUTES = 60
 
@@ -105,7 +88,7 @@ llm = ChatOllama(
 
 
 # ==========================================================================
-# 2. 세션 및 유틸리티
+# 2. 세션 및 유틸리티 (Async)
 # ==========================================================================
 def get_session_history(session_id: str):
     now = datetime.now()
@@ -114,19 +97,16 @@ def get_session_history(session_id: str):
     store[session_id]["last_access"] = now
 
     history = store[session_id]["history"]
-
     MAX_HISTORY = 20
     if len(history.messages) > MAX_HISTORY:
         overflow = len(history.messages) - MAX_HISTORY
         history.messages = history.messages[overflow:]
-
     return history
-
 
 async def cleanup_expired_sessions():
     while True:
         try:
-            await asyncio.sleep(600)
+            await asyncio.sleep(600) # 초
             now = datetime.now()
             expired = [sid for sid, data in store.items()
                        if now - data["last_access"] > timedelta(minutes=SESSION_TIMEOUT_MINUTES)]
@@ -137,8 +117,8 @@ async def cleanup_expired_sessions():
         except Exception as e:
             logger.error(f"세션 청소 오류: {e}")
 
-
-def invoke_chain_with_history(system_prompt: str, user_question: str, context: str, session_id: str):
+# ⚡ [Async] LLM 호출 헬퍼
+async def ainvoke_chain_with_history(system_prompt: str, user_question: str, context: str, session_id: str):
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("system", "[Context]\n{context}"),
@@ -151,16 +131,29 @@ def invoke_chain_with_history(system_prompt: str, user_question: str, context: s
         input_messages_key="question",
         history_messages_key="chat_history"
     )
-    return chain_with_hist.invoke(
+    # 비동기 호출 (.ainvoke)
+    return await chain_with_hist.ainvoke(
         {"question": user_question, "context": context},
         config={"configurable": {"session_id": session_id}}
     )
+
+# ⚡ [Async] 벡터 검색 헬퍼 (CPU 블로킹 방지)
+async def async_similarity_search(vectorstore, query, k=5):
+    if not vectorstore:
+        return []
+    # FAISS 검색은 CPU 연산이므로 별도 스레드에서 실행
+    return await asyncio.to_thread(vectorstore.similarity_search, query, k=k)
 
 
 # ==========================================================================
 # 3. 벡터스토어 초기화
 # ==========================================================================
 def initialize_all_vectorstores():
+    """
+    초기화는 앱 구동 시 1회 실행되므로 Sync 유지 가능하나,
+    필요 시 async로 변경 후 main.py lifespan에서 await 할 수 있음.
+    여기서는 기존 구조 유지를 위해 Sync로 두되, 내부 로직만 최적화.
+    """
     global embeddings, db_schema_vectorstore, doc_vectorstore
     logger.info("🚀 [Init] 벡터 스토어 초기화 시작…")
 
@@ -242,219 +235,174 @@ def extract_text_from_pdf(path: str) -> str:
 
 
 # ==========================================================================
-# 4. Intent Classifier & Helpers
+# 4. Intent Classifier & Logic Helpers (Async)
 # ==========================================================================
-def classify_intent_logic(question: str, has_file=False, file_snippet=None) -> str:
+async def classify_intent_logic(question: str, has_file=False, file_snippet=None, feedback=None) -> str:
     file_info = "No File"
     if has_file:
         snippet = file_snippet[:300] if file_snippet else ""
         file_info = f"File Uploaded. Snippet: '{snippet}...'"
 
+    # 🧩 Priority 4: 복합 의도 및 Feedback 반영
+    feedback_ctx = ""
+    if feedback:
+        feedback_ctx = f"NOTE: Previous attempt failed. Reason: '{feedback}'. Please Re-Classify carefully."
+
     router_prompt = f"""
-    You are an AI Intent Classifier.
-    [Context] Query: "{question}", File: {file_info}
+    You are an AI Intent Router.
+    [Context] Query: "{question}"
+    [File Info] {file_info}
+    [Feedback] {feedback_ctx}
 
-    Classify into EXACTLY ONE category:
+    Classify into ONE category:
 
-    1. FILE_ONLY: User asks about the uploaded file. (Valid ONLY if File exists)
-    2. VERSION_COMPARE: User compares uploaded file vs existing rules. (Valid ONLY if File exists)
-    
+    1. FILE_ONLY: Question *solely* about the uploaded file content.
+    2. VERSION_COMPARE: Compare uploaded file vs existing rules.
     3. CROSS_CHECK: 
-       - User wants to COMPARE 'Market Rules' vs 'DB Schema'.
-       - OR mentions BOTH "Document/Rule" AND "DB/Schema".
-
-    4. DB_DESIGN:
-       - User asks to DESIGN, CREATE, or MODEL a new table/procedure based on Rules.
-       - Keywords: "Create table", "Design schema", "Write DDL", "DB Modeling".
-
-    5. CODE_ANALYSIS: User pasted raw code/text (No file).
-    
-    6. DB_SCHEMA: 
-       - General DB questions (Finding tables, columns).
-       - Searching for data in a specific table (e.g. "Find in ete100t").
-       
-    7. RULE_DOC: General Rule questions.
-    8. GENERAL: General chat.
+       - Requires BOTH Rule Documents AND DB Schema.
+       - Complex queries like "Find rule for X and Query Y from DB".
+    4. DB_DESIGN: Create/Model new tables/DDL.
+    5. CODE_ANALYSIS: Raw code text provided.
+    6. DB_SCHEMA: Searching tables, columns, or generating SQL.
+    7. RULE_DOC: General regulation/rule questions.
+    8. GENERAL: Casual chat.
 
     Output ONLY category name.
     """
     try:
-        intent = llm.invoke(router_prompt).content.strip()
+        result = await llm.ainvoke(router_prompt)
+        intent = result.content.strip()
         valid = ["FILE_ONLY", "VERSION_COMPARE", "CROSS_CHECK", "DB_DESIGN", "CODE_ANALYSIS", "DB_SCHEMA", "RULE_DOC", "GENERAL"]
+        
+        # 가장 매칭되는 의도 찾기
         for v in valid:
             if v in intent: return v
+        
         return "FILE_ONLY" if has_file else "GENERAL"
     except Exception:
         return "FILE_ONLY" if has_file else "GENERAL"
 
 
-def extract_keyword(question: str):
-    return llm.invoke(f"질문: '{question}' 핵심 키워드 하나만 추출. 없으면 FALSE").content.strip()
+async def extract_keyword(question: str):
+    res = await llm.ainvoke(f"질문: '{question}' 핵심 키워드 하나만 추출. 없으면 FALSE")
+    return res.content.strip()
 
 
-def generate_sql_step_by_step(question: str, rule_context: str, db_context: str, session_id: str):
+async def generate_sql_step_by_step(question: str, rule_context: str, db_context: str, session_id: str):
     prompt = f"""
-[사용자 질문]
-{question}
-
-[규정]
-{rule_context}
-
-[DB 스키마]
-{db_context}
+        [사용자 질문] {question}
+        [규정] {rule_context}
+        [DB 스키마] {db_context}
     """
-    return invoke_chain_with_history(SQL_SYSTEM_PROMPT, question, prompt, session_id)
+    return await ainvoke_chain_with_history(SQL_SYSTEM_PROMPT, question, prompt, session_id)
 
 
 # ==========================================================================
-# 5. Handler Functions
+# 5. Handler Functions (Async) - Return Dict with 'answer' and 'context'
 # ==========================================================================
 def log_task_start(name: str, attempts: int):
-    """작업 시작 공통 로그"""
     prefix = "▶️ [First]" if attempts == 0 else f"🔄 [Retry {attempts}]"
     logger.info(f"{prefix} Node 실행: {name}")
 
-def rag_for_db_design(question: str, session_id="default"):
-    rule_ctx = ""
-    if doc_vectorstore:
-        rule_docs = doc_vectorstore.similarity_search(question, k=5)
-        rule_ctx = "\n".join([d.page_content for d in rule_docs])
+async def rag_for_db_design(question: str, session_id="default"):
+    rule_docs = await async_similarity_search(doc_vectorstore, question, k=5)
+    rule_ctx = "\n".join([d.page_content for d in rule_docs])
 
-    db_ctx = ""
-    if db_schema_vectorstore:
-        db_docs = db_schema_vectorstore.similarity_search(question, k=5)
-        db_ctx = "\n".join([d.page_content for d in db_docs])
+    db_docs = await async_similarity_search(db_schema_vectorstore, question, k=5)
+    db_ctx = "\n".join([d.page_content for d in db_docs])
 
-    sql_result = generate_sql_step_by_step(question, rule_ctx, db_ctx, session_id)
+    # 문맥 저장
+    full_ctx = f"[Rule]\n{rule_ctx}\n\n[DB Schema]\n{db_ctx}"
 
-    system = """
-    당신은 수석 DB 아키텍트입니다.
-    규정 기반으로 신규 Oracle 테이블 생성 DDL과 설계 근거를 설명하세요.
-    """
-    modeling_result = invoke_chain_with_history(system, question, rule_ctx + "\n\n" + db_ctx, session_id)
+    sql_result = await generate_sql_step_by_step(question, rule_ctx, db_ctx, session_id)
+    
+    system = "당신은 수석 DB 아키텍트입니다. 규정 기반으로 신규 테이블 DDL과 설계 근거를 설명하세요."
+    modeling_result = await ainvoke_chain_with_history(system, question, full_ctx, session_id)
 
-    return f"""
-=========================
-📌 Step-by-Step SQL 생성 결과
-=========================
-{sql_result}
+    return {
+        "answer": f"📌 [SQL Draft]\n{sql_result}\n\n📌 [Design]\n{modeling_result}",
+        "context": full_ctx
+    }
 
-=========================
-📌 규정 기반 데이터 모델 제안
-=========================
-{modeling_result}
-"""
+async def rag_for_uploaded_files(question, file_context, session_id):
+    # 긴 파일은 임시 처리 (실제로는 Chunking 필요)
+    used_context = file_context[:10000] + "..." if len(file_context) > 10000 else file_context
+    ans = await ainvoke_chain_with_history("파일 내용 분석", question, used_context, session_id)
+    return {"answer": ans, "context": used_context}
 
-
-def rag_for_uploaded_files(question, file_context, session_id):
-    if len(file_context) < 30000:
-        return invoke_chain_with_history("파일 내용을 분석하세요.", question, file_context, session_id)
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    docs = splitter.create_documents([file_context])
-    temp_vs = FAISS.from_documents(docs, embeddings)
-    res = temp_vs.similarity_search(question or "요약", k=8)
-    context = "\n".join([d.page_content for d in res])
-    return invoke_chain_with_history("파일 발췌본 기반", question, context, session_id)
-
-
-def rag_for_version_comparison(question, file_context, session_id):
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    docs = splitter.create_documents([file_context])
-    temp_vs = FAISS.from_documents(docs, embeddings)
-
+async def rag_for_version_comparison(question, file_context, session_id):
     search_q = question if len(question) > 5 else "변경"
-    old_ctx = ""
-    if doc_vectorstore:
-        old_docs = doc_vectorstore.similarity_search(search_q, k=5)
-        old_ctx = "\n".join([d.page_content for d in old_docs])
-
-    new_docs = temp_vs.similarity_search(search_q, k=5)
-    new_ctx = "\n".join([d.page_content for d in new_docs])
-
-    return invoke_chain_with_history(
-        "기존 규정과 신규 파일을 비교하세요.",
-        question,
-        f"[OLD]\n{old_ctx}\n\n[NEW]\n{new_ctx}",
-        session_id,
+    old_docs = await async_similarity_search(doc_vectorstore, search_q, k=5)
+    old_ctx = "\n".join([d.page_content for d in old_docs])
+    
+    full_ctx = f"[OLD Rules]\n{old_ctx}\n\n[NEW File]\n{file_context[:5000]}..."
+    
+    ans = await ainvoke_chain_with_history(
+        "기존 규정과 신규 파일 비교", question, full_ctx, session_id
     )
+    return {"answer": ans, "context": full_ctx}
 
-
-def rag_for_cross_check(question, session_id, file_context=None):
-    rule_ctx = ""
-    if doc_vectorstore:
-        docs = doc_vectorstore.similarity_search(question, k=5)
-        rule_ctx = "\n".join([d.page_content for d in docs])
-
-    db_ctx = ""
-    kw = extract_keyword(question)
+async def rag_for_cross_check(question, session_id, file_context=None):
+    # ⚡ 병렬 검색 (Rule + DB)
+    rule_task = async_similarity_search(doc_vectorstore, question, k=5)
+    db_task = async_similarity_search(db_schema_vectorstore, question, k=5)
+    
+    rule_docs, db_schema_docs = await asyncio.gather(rule_task, db_task)
+    
+    rule_ctx = "\n".join([d.page_content for d in rule_docs])
+    db_ctx = "\n".join([d.page_content for d in db_schema_docs])
+    
+    kw = await extract_keyword(question)
     if kw != "FALSE":
-        db_ctx += search_db_metadata(kw)
-
-    if db_schema_vectorstore:
-        docs = db_schema_vectorstore.similarity_search(question, k=5)
-        db_ctx += "\n" + "\n".join([d.page_content for d in docs])
+        db_ctx += "\n" + search_db_metadata(kw)
 
     file_info = f"[FILE]\n{file_context[:2000]}" if file_context else ""
+    full_ctx = f"{file_info}\n\n[규정]\n{rule_ctx}\n\n[DB 스키마]\n{db_ctx}"
 
-    return invoke_chain_with_history(
-        "규정 vs DB 정합성 점검",
-        question,
-        f"{file_info}\n\n[규정]\n{rule_ctx}\n\n[DB]\n{db_ctx}",
-        session_id,
+    ans = await ainvoke_chain_with_history(
+        "규정(Rule)과 DB 스키마 간의 정합성/매핑 분석", question, full_ctx, session_id
     )
+    return {"answer": ans, "context": full_ctx}
 
+async def analyze_code_context(question, full_context, session_id):
+    ans = await ainvoke_chain_with_history("코드 분석", question, full_context, session_id)
+    return {"answer": ans, "context": full_context}
 
-def analyze_code_context(question, full_context, session_id):
-    return invoke_chain_with_history("코드 분석 전문가", question, full_context, session_id)
+async def rag_for_db_schema(question, session_id="default"):
+    # 1. SQL 생성 요청인 경우
+    if any(kw in question.lower() for kw in ["sql", "쿼리", "select", "ddl"]):
+        rule_docs = await async_similarity_search(doc_vectorstore, question, k=5)
+        db_docs = await async_similarity_search(db_schema_vectorstore, question, k=5)
+        
+        rule_ctx = "\n".join([d.page_content for d in rule_docs])
+        db_ctx = "\n".join([d.page_content for d in db_docs])
+        full_ctx = f"[Rule]\n{rule_ctx}\n\n[DB Schema]\n{db_ctx}"
+        
+        ans = await generate_sql_step_by_step(question, rule_ctx, db_ctx, session_id)
+        return {"answer": ans, "context": full_ctx}
 
+    # 2. 일반 DB 질문인 경우
+    docs = await async_similarity_search(db_schema_vectorstore, question, k=8)
+    full_ctx = "\n".join([d.page_content for d in docs])
+    
+    ans = await ainvoke_chain_with_history("DB 전문가", question, full_ctx, session_id)
+    return {"answer": ans, "context": full_ctx}
 
-def rag_for_db_schema(question, session_id="default"):
-    if any(kw in question.lower() for kw in ["sql", "쿼리", "select", "join", "ddl", "dml"]):
-        rule_ctx = ""
-        if doc_vectorstore:
-            docs = doc_vectorstore.similarity_search(question, k=5)
-            rule_ctx = "\n".join([d.page_content for d in docs])
+async def rag_for_rules(question, session_id):
+    docs = await async_similarity_search(doc_vectorstore, question, k=10)
+    full_ctx = "\n".join([d.page_content for d in docs])
+    ans = await ainvoke_chain_with_history("규정 전문가", question, full_ctx, session_id)
+    return {"answer": ans, "context": full_ctx}
 
-        db_ctx = ""
-        if db_schema_vectorstore:
-            docs = db_schema_vectorstore.similarity_search(question, k=5)
-            db_ctx = "\n".join([d.page_content for d in docs])
-
-        return generate_sql_step_by_step(question, rule_ctx, db_ctx, session_id)
-
-    keyword = extract_keyword(question)
-    context = ""
-
-    if keyword != "FALSE" and len(keyword) > 1:
-        context += f"[DB 메타데이터]\n{search_db_metadata(keyword)}\n"
-        if db_schema_vectorstore:
-            docs = db_schema_vectorstore.similarity_search(question, k=8)
-            context += "[유사도]\n" + "\n".join([d.page_content for d in docs])
-    else:
-        docs = db_schema_vectorstore.similarity_search(question, k=10)
-        context = "\n".join([d.page_content for d in docs])
-
-    return invoke_chain_with_history("Oracle DB 전문가", question, context, session_id)
-
-
-def rag_for_rules(question, session_id):
-    context = ""
-    if doc_vectorstore:
-        docs = doc_vectorstore.similarity_search(question, k=10)
-        context = "\n".join([d.page_content for d in docs])
-    return invoke_chain_with_history("규정 전문가", question, context, session_id)
-
-
-def ask_llm_general(question, session_id):
-    return invoke_chain_with_history("도움이 되는 AI", question, "", session_id)
+async def ask_llm_general(question, session_id):
+    ans = await ainvoke_chain_with_history("도움이 되는 AI", question, "", session_id)
+    return {"answer": ans, "context": "General Chat (No specific context)"}
 
 
 # ==========================================================================
-# 6. LangGraph Definition (Verified Loop with Logging & Path Map)
+# 6. LangGraph Definition (Async & Enhanced Flow)
 # ==========================================================================
 
-# 6.1 State 정의
 class AgentState(TypedDict):
     question: str
     session_id: str
@@ -462,155 +410,135 @@ class AgentState(TypedDict):
     has_file: bool
     intent: str
     answer: str
-    attempts: int       # 재시도 횟수
-    feedback: str       # Validator 피드백
+    attempts: int
+    feedback: str
+    context: str # 👈 [필수] 검증 단계에서 사용할 검색된 근거 문서
 
-# 6.2 Helper: 질문 강화 (Feedback Injection)
 def enhance_query_with_feedback(state: AgentState) -> str:
-    """재시도인 경우, 피드백을 반영해 질문을 수정"""
     query = state["question"]
     if state["attempts"] > 0 and state.get("feedback"):
-        # 📝 로그: 피드백 반영 확인
-        logger.info(f"🔄 [Loop] 피드백 반영 중: '{state['feedback']}'")
-        
-        enhanced_query = f"""
-        {query}
-        
-        [이전 시도에 대한 피드백]
-        이전 답변이 다음 이유로 부족했습니다: "{state['feedback']}"
-        이 피드백을 반영하여 답변을 개선하거나 수정해 주세요.
-        """
-        return enhanced_query
+        logger.info(f"🔄 [Loop] 질문 개선(피드백 반영): '{state['feedback']}'")
+        return f"{query}\n[Feedback to reflect]: {state['feedback']}\nPlease Improve answer."
     return query
 
-# 6.3 Router Node
-def router_node(state: AgentState):
+# ⚡ [Async] Router Node
+async def router_node(state: AgentState):
     query = state["question"]
-    file_snippet = state["file_context"][:500] if state["file_context"] else None
     
-    # 🚦 로그: 라우터 시작
-    logger.info(f"🚦 [Router] 질문 분석 중: '{query[:50]}...'")
+    # 재시도인 경우 attempts 유지, 아니면 0으로 초기화하지 않음 (그래프 진입 시 초기화됨)
+    current_attempts = state.get("attempts", 0)
+    feedback = state.get("feedback", "")
     
-    intent = classify_intent_logic(query, state["has_file"], file_snippet)
+    # 피드백이 있으면 질문을 수정하거나 Intent를 변경할 수 있음
+    intent = await classify_intent_logic(query, state["has_file"], state["file_context"], feedback)
     
-    # 🔀 로그: 분류된 의도
-    logger.info(f"🔀 [Router] 분류 결과: {intent}")
+    logger.info(f"🔀 [Router] Intent: {intent} (Attempts: {current_attempts})")
     
     return {
         "intent": intent,
-        "attempts": 0,
-        "feedback": ""
+        "attempts": current_attempts, # 카운트 유지
+        "feedback": "" # 라우팅 후 피드백 초기화 (새 시도 시작)
     }
 
-# 6.4 Task Wrapper Nodes (피드백 반영 & 로그 추가)
-def file_only_node(state: AgentState):
+# ⚡ [Async] Task Nodes (Dict Unpacking)
+async def file_only_node(state: AgentState):
     log_task_start("FILE_ONLY", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_uploaded_files(q, state["file_context"], state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_uploaded_files(q, state["file_context"], state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def version_compare_node(state: AgentState):
+async def version_compare_node(state: AgentState):
     log_task_start("VERSION_COMPARE", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_version_comparison(q, state["file_context"], state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_version_comparison(q, state["file_context"], state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def cross_check_node(state: AgentState):
+async def cross_check_node(state: AgentState):
     log_task_start("CROSS_CHECK", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_cross_check(q, state["session_id"], state["file_context"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_cross_check(q, state["session_id"], state["file_context"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def db_design_node(state: AgentState):
+async def db_design_node(state: AgentState):
     log_task_start("DB_DESIGN", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_db_design(q, state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_db_design(q, state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def code_analysis_node(state: AgentState):
+async def code_analysis_node(state: AgentState):
     log_task_start("CODE_ANALYSIS", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": analyze_code_context(q, state["file_context"], state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await analyze_code_context(q, state["file_context"], state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def db_schema_node(state: AgentState):
+async def db_schema_node(state: AgentState):
     log_task_start("DB_SCHEMA", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_db_schema(q, state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_db_schema(q, state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def rule_doc_node(state: AgentState):
+async def rule_doc_node(state: AgentState):
     log_task_start("RULE_DOC", state["attempts"])
     q = enhance_query_with_feedback(state)
-    return {"answer": rag_for_rules(q, state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await rag_for_rules(q, state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-def general_node(state: AgentState):
+async def general_node(state: AgentState):
     log_task_start("GENERAL", state["attempts"])
-    return {"answer": ask_llm_general(state["question"], state["session_id"]), "attempts": state["attempts"] + 1}
+    res = await ask_llm_general(state["question"], state["session_id"])
+    return {"answer": res["answer"], "context": res["context"], "attempts": state["attempts"] + 1}
 
-# 6.5 Validator Node
-def validator_node(state: AgentState):
-    """답변 평가 및 재시도 결정"""
+# ⚡ [Async] Validator Node
+async def validator_node(state: AgentState):
     current_answer = state["answer"]
     intent = state["intent"]
     
-    # 🧐 로그: 검증 시작
-    logger.info(f"🧐 [Validator] 답변 평가 중... (Intent: {intent})")
-    
-    # 간단한 검증 (일반 대화나 너무 짧은 답변은 패스)
     if intent == "GENERAL" or len(current_answer) < 10:
-        logger.info("⏩ [Validator] 일반 대화/단답형이므로 즉시 통과")
         return {"feedback": "PASS"}
 
-    validation_prompt = f"""
-    [질문]: {state["question"]}
-    [의도]: {intent}
-    [AI 답변]: {current_answer}
+    # Validator에게 Context 제공
+    val_prompt = f"""
+    [질문]: {state['question']}
+    [검색된 근거 문서/Context]:
+    {state['context']} 
+
+    [AI 답변]: 
+    {current_answer}
     """
     
     try:
-        # 평가 수행
-        result = invoke_chain_with_history(VALIDATOR_SYSTEM_PROMPT, "평가하라", validation_prompt, "validator_session")
+        # 검증도 비동기 실행
+        result = await ainvoke_chain_with_history(VALIDATOR_SYSTEM_PROMPT, "Evaluate", val_prompt, "validator_session")
         
         if "FAIL" in result:
-            reason = result.split("REASON:")[-1].strip() if "REASON:" in result else "정확도 부족"
-            # ⚠️ 로그: 검증 실패
+            reason = result.split("REASON:")[-1].strip() if "REASON:" in result else "Low Quality"
             logger.warning(f"⚠️ [Validator] REJECTED: {reason}")
             return {"feedback": reason}
         else:
-            # ✅ 로그: 검증 통과
-            logger.info("✅ [Validator] PASSED")
             return {"feedback": "PASS"}
             
     except Exception as e:
         logger.error(f"Validator Error: {e}")
         return {"feedback": "PASS"}
 
-# 6.6 Conditional Logic Helpers
-def should_retry(state: AgentState) -> Literal["retry", "end"]:
+# 🔄 Conditional Logic (Retry to Router)
+def should_retry_or_end(state: AgentState) -> Literal["retry", "end"]:
     feedback = state.get("feedback", "PASS")
     attempts = state["attempts"]
-    MAX_RETRIES = 2 
+    MAX_RETRIES = 2
 
     if feedback == "PASS":
-        logger.info("🏁 [Edge] 검증 통과 -> 종료(End)")
+        logger.info("🏁 [Edge] 검증 통과 -> 종료")
         return "end"
     
-    if attempts >= MAX_RETRIES:
-        logger.info(f"🛑 [Edge] 최대 재시도({MAX_RETRIES}) 도달 -> 종료(End)")
+    if attempts > MAX_RETRIES:
+        logger.info(f"🛑 [Edge] 최대 재시도({MAX_RETRIES}) 초과 -> 종료")
         return "end"
     
-    logger.info(f"🔙 [Edge] 재시도 필요 -> 다시 {state['intent']} 노드로 이동")
+    # 🔄 Priority 3: 실패 시 Router로 보내서 의도 재분석 기회 부여
+    logger.info(f"🔙 [Edge] 재시도 필요 (Feedback: {feedback}) -> Router로 회귀")
     return "retry"
 
-def route_back_to_intent(state: AgentState):
-    intent_map = {
-        "FILE_ONLY": "file_only",
-        "VERSION_COMPARE": "version_compare",
-        "CROSS_CHECK": "cross_check",
-        "DB_DESIGN": "db_design",
-        "CODE_ANALYSIS": "code_analysis",
-        "DB_SCHEMA": "db_schema",
-        "RULE_DOC": "rule_doc",
-        "GENERAL": "general"
-    }
-    return intent_map.get(state["intent"], "general")
-
-# 6.7 Graph Build
 def build_rag_graph():
     workflow = StateGraph(AgentState)
 
@@ -640,34 +568,21 @@ def build_rag_graph():
         "RULE_DOC": "rule_doc",
         "GENERAL": "general"
     }
-    
     workflow.add_conditional_edges("router", lambda x: x["intent"], intent_map)
 
     # Tasks -> Validator
     for node_name in intent_map.values():
         workflow.add_edge(node_name, "validator")
 
-    # Validator -> Loop or End (여기에 Explicit Mapping 추가)
-    def validator_router(state):
-        decision = should_retry(state)
-        if decision == "end":
-            return "end"
-        else:
-            return route_back_to_intent(state)
-
-    path_map = {
-        "end": END,
-        "file_only": "file_only",
-        "version_compare": "version_compare",
-        "cross_check": "cross_check",
-        "db_design": "db_design",
-        "code_analysis": "code_analysis",
-        "db_schema": "db_schema",
-        "rule_doc": "rule_doc",
-        "general": "general"
-    }
-
-    workflow.add_conditional_edges("validator", validator_router, path_map)
+    # 🔄 Validator -> Router (Retry) or End
+    workflow.add_conditional_edges(
+        "validator",
+        should_retry_or_end,
+        {
+            "end": END,
+            "retry": "router"  # 실패 시 Router로 돌아감
+        }
+    )
 
     return workflow.compile()
 
@@ -675,14 +590,11 @@ rag_graph = build_rag_graph()
 
 
 # ==========================================================================
-# 7. Main Execution Interface
+# 7. Main Execution Interface (Async)
 # ==========================================================================
-def execute_rag_task(query: str, session_id: str, file_context: str = "", has_file: bool = False) -> Dict[str, Any]:
+async def execute_rag_task(query: str, session_id: str, file_context: str = "", has_file: bool = False) -> Dict[str, Any]:
     try:
-        # 🚀 로그: 전체 프로세스 시작
-        logger.info("="*50)
-        logger.info(f"🚀 [LangGraph Start] New Request (Session: {session_id})")
-        logger.info("="*50)
+        logger.info(f"🚀 [Async RAG] New Request (Session: {session_id})")
 
         initial_state = {
             "question": query,
@@ -692,26 +604,18 @@ def execute_rag_task(query: str, session_id: str, file_context: str = "", has_fi
             "intent": "GENERAL",
             "answer": "",
             "attempts": 0,
-            "feedback": ""
+            "feedback": "",
+            "context": "" # 👈 [필수] 초기 상태에 context 키 추가
         }
 
-        # 그래프 실행
-        result = rag_graph.invoke(initial_state)
+        # 비동기 그래프 실행 (.ainvoke)
+        result = await rag_graph.ainvoke(initial_state)
         
-        final_intent = result.get("intent", "GENERAL")
-        final_answer = result.get("answer", "No Answer")
-        attempts = result.get("attempts", 1)
-
-        if attempts > 1:
-            logger.info(f"✨ [Done] 품질 향상 루프 완료 (총 {attempts}회 시도)")
-        else:
-            logger.info("✨ [Done] 단일 시도 완료")
-
         return {
-            "intent": final_intent,
-            "answer": final_answer
+            "intent": result.get("intent", "GENERAL"),
+            "answer": result.get("answer", "No Answer")
         }
 
     except Exception as e:
-        logger.error(f"❌ [LangGraph Error] Execution Failed: {e}")
+        logger.exception("LangGraph Execution Failed")
         return {"intent": "ERROR", "answer": f"시스템 오류 발생: {e}"}
